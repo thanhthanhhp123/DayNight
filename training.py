@@ -9,136 +9,214 @@ from PIL import Image
 from torchvision.utils import save_image
 import os
 from datasets import DayNightDataset
-from model import AttentionGenerator, AttentionDiscriminator
+from model import EnhancedGenerator, PatchGANDiscriminator, init_weights
+import torch.optim as optim
+import itertools
+from torch.cuda.amp import autocast, GradScaler
 
-def train(args):
+class GANLoss(nn.Module):
+    def __init__(self, gan_mode='lsgan'):
+        super(GANLoss, self).__init__()
+        self.gan_mode = gan_mode
+        if gan_mode == 'lsgan':
+            self.loss = nn.MSELoss()
+        elif gan_mode == 'vanilla':
+            self.loss = nn.BCEWithLogitsLoss()
+        
+    def __call__(self, prediction, target_is_real):
+        target_tensor = torch.ones_like(prediction) if target_is_real else torch.zeros_like(prediction)
+        return self.loss(prediction, target_tensor)
+
+
+def train_model(config):
+    # Set up device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dataset = DayNightDataset(args.day_dir, args.night_dir)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-
-    G_day2night = AttentionGenerator().to(device)
-    G_night2day = AttentionGenerator().to(device)
-    D_day = AttentionDiscriminator().to(device)
-    D_night = AttentionDiscriminator().to(device)
-
-    criterion_GAN = nn.MSELoss()
+    
+    # Initialize models
+    netG_A2B = EnhancedGenerator(in_channels=3).to(device)
+    netG_B2A = EnhancedGenerator(in_channels=3).to(device)
+    netD_A = PatchGANDiscriminator(in_channels=3).to(device)
+    netD_B = PatchGANDiscriminator(in_channels=3).to(device)
+    
+    # Initialize weights
+    init_weights(netG_A2B)
+    init_weights(netG_B2A)
+    init_weights(netD_A)
+    init_weights(netD_B)
+    
+    # Setup data loader
+    dataset = DayNightDataset(config['day_dir'], config['night_dir'])
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=config['batch_size'],
+        shuffle=True,
+        num_workers=config['num_workers'],
+        pin_memory=True
+    )
+    
+    # Loss functions
+    criterion_GAN = GANLoss(gan_mode='lsgan').to(device)
     criterion_cycle = nn.L1Loss()
-    criterion_identity = nn.L1Loss()    
-
-    optimizer_G = torch.optim.Adam(
-        list(G_day2night.parameters()) + list(G_night2day.parameters()),
-        lr=args.lr, betas=(args.beta1, args.beta2)
+    criterion_identity = nn.L1Loss()
+    
+    # Optimizers
+    optimizer_G = optim.Adam(
+        itertools.chain(netG_A2B.parameters(), netG_B2A.parameters()),
+        lr=config['lr'],
+        betas=(0.5, 0.999)
     )
-
-    optimizer_D = torch.optim.Adam(
-        list(D_day.parameters()) + list(D_night.parameters()),
-        lr=args.lr, betas=(args.beta1, args.beta2)
+    optimizer_D = optim.Adam(
+        itertools.chain(netD_A.parameters(), netD_B.parameters()),
+        lr=config['lr'],
+        betas=(0.5, 0.999)
     )
-
-    for epoch in tqdm(range(args.epochs)):
-        for i, (real_day, real_night) in enumerate(dataloader):
-            real_night = real_night.to(device)
-            real_day = real_day.to(device)
-
-            fake_night = G_day2night(real_day)
-            fake_day = G_night2day(real_night)
-
-            recovered_day = G_night2day(fake_night)
-            recovered_night = G_day2night(fake_day)
-
-            identity_day = G_night2day(real_day)
-            identity_night = G_day2night(real_night)
-
-            optimizer_G.zero_grad()
-
-            loss_identity = (criterion_identity(identity_day, real_day) + 
-                           criterion_identity(identity_night, real_night)) * 5.0
+    
+    # Learning rate schedulers
+    scheduler_G = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_G, 
+        T_max=config['num_epochs'],
+        eta_min=config['lr'] * 0.1
+    )
+    scheduler_D = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_D,
+        T_max=config['num_epochs'],
+        eta_min=config['lr'] * 0.1
+    )
+    
+    # Gradient scaler for mixed precision training
+    scaler = GradScaler()
+    
+    # Training loop
+    for epoch in range(config['num_epochs']):
+        # Progress bar
+        pbar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{config["num_epochs"]}')
+        
+        for i, (real_A, real_B) in enumerate(pbar):
+            real_A = real_A.to(device)
+            real_B = real_B.to(device)
             
-            loss_GAN = (criterion_GAN(D_night(fake_night), torch.ones_like(D_night(fake_night))) +
-                       criterion_GAN(D_day(fake_day), torch.ones_like(D_day(fake_day))))
-            loss_cycle = (criterion_cycle(recovered_day, real_day) + 
-                         criterion_cycle(recovered_night, real_night)) * 10.0
-            
-            loss_G = loss_GAN + loss_cycle + loss_identity
-            loss_G.backward()
-            optimizer_G.step()
-
-            optimizer_D.zero_grad()
-            loss_D_day = (criterion_GAN(D_day(real_day), torch.ones_like(D_day(real_day))) +
-                         criterion_GAN(D_day(fake_day.detach()), torch.zeros_like(D_day(fake_day))))
-            
-            # Night discriminator
-            loss_D_night = (criterion_GAN(D_night(real_night), torch.ones_like(D_night(real_night))) +
-                           criterion_GAN(D_night(fake_night.detach()), torch.zeros_like(D_night(fake_night))))
-            
-            loss_D = (loss_D_day + loss_D_night) * 0.5
-            loss_D.backward()
-            optimizer_D.step()
-
-            if i % 100 == 0:
-                print(f"Epoch [{epoch}/{args.epochs}] Batch [{i}] "
-                      f"Loss_D: {loss_D.item():.4f} Loss_G: {loss_G.item():.4f}")
+            # Generate identity mappings
+            with autocast():
+                same_B = netG_A2B(real_B)
+                same_A = netG_B2A(real_A)
                 
-        if (epoch + 1) % 10 == 0:
-            torch.save({
-                'G_day2night': G_day2night.state_dict(),
-                'G_night2day': G_night2day.state_dict(),
-                'D_day': D_day.state_dict(),
-                'D_night': D_night.state_dict()
-            }, f'checkpoint_epoch_{epoch+1}.pth')
+                # Translation
+                fake_B = netG_A2B(real_A)
+                fake_A = netG_B2A(real_B)
+                
+                # Cycle
+                recovered_A = netG_B2A(fake_B)
+                recovered_B = netG_A2B(fake_A)
+                
+                # Train Generators
+                optimizer_G.zero_grad()
+                
+                # Identity loss
+                loss_identity_A = criterion_identity(same_A, real_A) * config['lambda_identity']
+                loss_identity_B = criterion_identity(same_B, real_B) * config['lambda_identity']
+                
+                # GAN loss
+                loss_GAN_A2B = criterion_GAN(netD_B(fake_B), True)
+                loss_GAN_B2A = criterion_GAN(netD_A(fake_A), True)
+                
+                # Cycle loss
+                loss_cycle_A = criterion_cycle(recovered_A, real_A) * config['lambda_cycle']
+                loss_cycle_B = criterion_cycle(recovered_B, real_B) * config['lambda_cycle']
+                
+                # Total generator loss
+                loss_G = (loss_identity_A + loss_identity_B + 
+                         loss_GAN_A2B + loss_GAN_B2A + 
+                         loss_cycle_A + loss_cycle_B)
+            
+            # Update generators
+            scaler.scale(loss_G).backward()
+            scaler.step(optimizer_G)
+            
+            # Train Discriminators
+            with autocast():
+                optimizer_D.zero_grad()
+                
+                # Real loss
+                loss_D_real_A = criterion_GAN(netD_A(real_A), True)
+                loss_D_real_B = criterion_GAN(netD_B(real_B), True)
+                
+                # Fake loss
+                loss_D_fake_A = criterion_GAN(netD_A(fake_A.detach()), False)
+                loss_D_fake_B = criterion_GAN(netD_B(fake_B.detach()), False)
+                
+                # Total discriminator loss
+                loss_D_A = (loss_D_real_A + loss_D_fake_A) * 0.5
+                loss_D_B = (loss_D_real_B + loss_D_fake_B) * 0.5
+                loss_D = loss_D_A + loss_D_B
+            
+            # Update discriminators
+            scaler.scale(loss_D).backward()
+            scaler.step(optimizer_D)
+            scaler.update()
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'G_loss': f'{loss_G.item():.4f}',
+                'D_loss': f'{loss_D.item():.4f}'
+            })
+            
+            # Save intermediate results
+            if i % config['save_frequency'] == 0:
+                save_image(real_A, fake_B, recovered_A, 
+                          real_B, fake_A, recovered_B,
+                          epoch, i, config['output_dir'])
+        
+        # Update learning rates
+        scheduler_G.step()
+        scheduler_D.step()
+        
+        # Save models
+        if (epoch + 1) % config['checkpoint_frequency'] == 0:
+            save_checkpoint({
+                'epoch': epoch + 1,
+                'netG_A2B_state_dict': netG_A2B.state_dict(),
+                'netG_B2A_state_dict': netG_B2A.state_dict(),
+                'netD_A_state_dict': netD_A.state_dict(),
+                'netD_B_state_dict': netD_B.state_dict(),
+                'optimizer_G_state_dict': optimizer_G.state_dict(),
+                'optimizer_D_state_dict': optimizer_D.state_dict(),
+            }, config['checkpoint_dir'], epoch + 1)
 
-def test(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def save_image(real_A, fake_B, recovered_A, real_B, fake_A, recovered_B, epoch, batch, output_dir):
+    """Lưu ảnh kết quả trong quá trình training"""
+    from torchvision.utils import save_image
+    
+    # Tạo grid ảnh
+    image_grid = torch.cat([
+        torch.cat([real_A, fake_B, recovered_A], dim=3),
+        torch.cat([real_B, fake_A, recovered_B], dim=3)
+    ], dim=2)
+    
+    # Lưu ảnh
+    save_image(image_grid, 
+              os.path.join(output_dir, f'epoch_{epoch}_batch_{batch}.png'),
+              normalize=True)
 
-    # Load models
-    G_day2night = AttentionGenerator().to(device)
-    G_night2day = AttentionGenerator().to(device)
-    checkpoint = torch.load(args.checkpoint)
-    G_day2night.load_state_dict(checkpoint['G_day2night'])
-    G_night2day.load_state_dict(checkpoint['G_night2day'])
+def save_checkpoint(state, checkpoint_dir, epoch):
+    """Lưu checkpoint model"""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    torch.save(state, os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pth'))
 
-    G_day2night.eval()
-    G_night2day.eval()
-
-    transform = transforms.Compose([
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
-
-    day_images = os.listdir(args.day_dir)
-    night_images = os.listdir(args.night_dir)
-
-    os.makedirs('results/day2night', exist_ok=True)
-    os.makedirs('results/night2day', exist_ok=True)
-
-    with torch.no_grad():
-        for img_name in day_images:
-            img_path = os.path.join(args.day_dir, img_name)
-            img = Image.open(img_path).convert('RGB')
-            img = transform(img).unsqueeze(0).to(device)
-
-            fake_night = G_day2night(img)
-            save_image(fake_night, f'results/day2night/{img_name}')
-
-        for img_name in night_images:
-            img_path = os.path.join(args.night_dir, img_name)
-            img = Image.open(img_path).convert('RGB')
-            img = transform(img).unsqueeze(0).to(device)
-
-            fake_day = G_night2day(img)
-            save_image(fake_day, f'results/night2day/{img_name}')
-
+# Configuration
+config = {
+    'day_dir': 'day_night_images/train/day',
+    'night_dir': 'day_night_images/train/night',
+    'batch_size': 4,
+    'num_workers': 4,
+    'lr': 2e-4,
+    'num_epochs': 200,
+    'lambda_identity': 5.0,
+    'lambda_cycle': 10.0,
+    'save_frequency': 100,
+    'checkpoint_frequency': 5,
+    'output_dir': 'outputs',
+    'checkpoint_dir': 'checkpoints'
+}
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--day_dir', type=str, required=True, default='day_night_images/training/day')
-    parser.add_argument('--night_dir', type=str, required=True, default='day_night_images/training/night')
-    parser.add_argument('--batch_size', type=int, default=1)
-    parser.add_argument('--lr', type=float, default=0.0002)
-    parser.add_argument('--beta1', type=float, default=0.5)
-    parser.add_argument('--beta2', type=float, default=0.999)
-    parser.add_argument('--epochs', type=int, default=200)
-    args = parser.parse_args()
-    train(args)
-                
+    train_model(config)
